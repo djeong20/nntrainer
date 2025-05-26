@@ -622,6 +622,49 @@ TEST(blas_kernels, absolute_sum) {
   EXPECT_FLOAT_EQ(cpu_result, gpu_result);
 }
 
+TEST(blas_kernels, amax_cl) {
+  int batch = 4;
+  int channel = 5;
+  int height = 200;
+  int width = 300;
+
+  TensorDim::TensorType type = {Tformat::NCHW, Tdatatype::FP32};
+  Tensor A(batch, channel, height, width, type);
+
+  GEN_TEST_INPUT_RAND(A, -10000.0, 10000.0);
+
+  int cpu_result = 0;
+  for (int i = 1; i < (int)A.size(); ++i) {
+    cpu_result =
+      fabsf(A.getData<float>()[cpu_result]) < fabsf(A.getData<float>()[i])
+        ? i
+        : cpu_result;
+  }
+  int gpu_result = amaxCl(A);
+  EXPECT_EQ(A.getData<float>()[cpu_result], A.getData<float>()[gpu_result]);
+}
+
+TEST(blas_kernels, amin_cl) {
+  int batch = 4;
+  int channel = 5;
+  int height = 200;
+  int width = 300;
+
+  TensorDim::TensorType type = {Tformat::NCHW, Tdatatype::FP32};
+  Tensor A(batch, channel, height, width, type);
+
+  GEN_TEST_INPUT_RAND(A, -10000.0, 10000.0);
+  int cpu_result = 0;
+  for (int i = 1; i < (int)A.size(); ++i) {
+    cpu_result =
+      fabsf(A.getData<float>()[i]) < fabsf(A.getData<float>()[cpu_result])
+        ? i
+        : cpu_result;
+  }
+  int gpu_result = aminCl(A);
+  EXPECT_EQ(A.getData<float>()[cpu_result], A.getData<float>()[gpu_result]);
+}
+
 #ifdef ENABLE_FP16
 
 TEST(blas_kernels, dotCL_sgemv_M_1_1_fp16) {
