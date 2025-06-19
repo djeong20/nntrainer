@@ -172,6 +172,7 @@ endif
 if get_option('enable-opencl')
   message ('OpenCL build is now enabled and will function only if an OpenCL-supported GPU is available. Using CLBlast as the OpenCL backend.')
   extra_defines += '-DENABLE_OPENCL=1'
+  extra_defines += '-DCL_TARGET_OPENCL_VERSION=200'
   clblast_options = cmake.subproject_options()
 
   if get_option('platform') == 'android'
