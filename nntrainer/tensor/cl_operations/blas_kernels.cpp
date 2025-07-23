@@ -252,7 +252,7 @@ void sgemm_q4_k_cl(const unsigned int M, const unsigned int N,
     return;
   }
 
-  if (!kernel->SetKernelArguments(3, &M, sizeof(int))) {
+  if (!kernel->SetKernelArguments(3, &N, sizeof(int))) {
     printf("Failed to set kernel argument 3 for mat_mul_q4_K_8x8_q8_K");
     return;
   }

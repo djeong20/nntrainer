@@ -49,7 +49,7 @@ const std::string &getQ4KGemmClKernel() {
     __kernel void mat_mul_q4_K_8x8_q8_K(__global const block_q4_K *restrict a,
                                        __global const float *restrict b,
                                        __global float *restrict c,
-                                       const int M, const int K) {
+                                       const int N, const int K) {
       const uint ix = get_sub_group_local_id() / 8;  // 0...3
       const uint it = get_sub_group_local_id() % 8;  // 0...7
       const uint iq = it / 4; // 0 or 1
@@ -134,7 +134,7 @@ const std::string &getQ4KGemmClKernel() {
       for (int row = 0; row < N_DST; ++row) {
           float all_sum = sub_group_reduce_add(sumf[row]);
           if (sub_group_elect()) {
-              c[r1 * M + first_row + row] = all_sum;
+              c[r1 * N + first_row + row] = all_sum;
           }
       }
     }
