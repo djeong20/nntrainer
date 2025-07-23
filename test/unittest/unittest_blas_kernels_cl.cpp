@@ -1430,8 +1430,8 @@ static void run_q_4_K_test(const uint32_t M, const uint32_t K,
       nntrainer::sgemv_q4_k_cl(N, K, q4_weight_repack_ptr, activations_f32_ptr,
                                (float *)gpu_q4_dst);
     else
-      nntrainer::sgemm_q4_k_cl(M, N, K, q4_weight_repack_ptr,
-                               activations_f32_ptr, (float *)gpu_q4_dst);
+      nntrainer::sgemm_q4_k_cl(M, N, K, q4_weight_ptr, activations_f32_ptr,
+                               (float *)gpu_q4_dst);
   }
   auto t4 = std::chrono::high_resolution_clock::now();
   auto gpu_dt = std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3);

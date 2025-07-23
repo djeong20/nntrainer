@@ -207,74 +207,63 @@ void sgemm_q4_k_cl(const unsigned int M, const unsigned int N,
   }
 
   /// @note Dynamic quatization for matBdata
-  const size_t qk_k = 256;
-  const size_t sizeof_block_q8_K = 292;
+  // const size_t qk_k = 256;
+  // const size_t sizeof_block_q8_K = 292;
 
-  const unsigned int blocks_per_4_rows = (K + qk_k - 1) / qk_k;
-  const unsigned int qb_4_rows_size = sizeof_block_q8_K * 4 * blocks_per_4_rows;
-  const size_t qb_row_size = (sizeof_block_q8_K * K) / qk_k;
-  const unsigned int qb_size = qb_4_rows_size * (((M >> 2) << 2) / 4 + 1);
-  const unsigned int M4 = ((M - M % 4) / 4);
-  const int B_step = 144 * (K / qk_k);
+  // const unsigned int blocks_per_4_rows = (K + qk_k - 1) / qk_k;
+  // const unsigned int qb_4_rows_size = sizeof_block_q8_K * 4 *
+  // blocks_per_4_rows; const size_t qb_row_size = (sizeof_block_q8_K * K) /
+  // qk_k; const unsigned int qb_size = qb_4_rows_size * (((M >> 2) << 2) / 4 +
+  // 1); const unsigned int M4 = ((M - M % 4) / 4); const int B_step = 144 * (K
+  // / qk_k);
 
-  void *quantBdata = blas_cc->context_inst_.createSVMRegion(qb_size);
+  // void *quantBdata = blas_cc->context_inst_.createSVMRegion(qb_size);
 
-  if (M == 1) {
-    nntrainer::quantize_row_q8_K((float *)matBdata, quantBdata, K);
-  } else {
-    for (int i = 0; i < static_cast<int>(M4); i++) {
-      ::ggml_quantize_mat_q8_K_4x8(
-        ((float *)matBdata) + 4 * i * K,
-        reinterpret_cast<char *>(quantBdata) + i * qb_4_rows_size, K);
-    }
+  // if (M == 1) {
+  //   nntrainer::quantize_row_q8_K((float *)matBdata, quantBdata, K);
+  // } else {
+  //   for (int i = 0; i < static_cast<int>(M4); i++) {
+  //     ::ggml_quantize_mat_q8_K_4x8(
+  //       ((float *)matBdata) + 4 * i * K,
+  //       reinterpret_cast<char *>(quantBdata) + i * qb_4_rows_size, K);
+  //   }
 
-    for (unsigned int i = M4 * 4; i < M; i++) {
-      nntrainer::quantize_row_q8_K(((float *)matBdata) + i * K,
-                                   (reinterpret_cast<char *>(quantBdata) +
-                                    (M4 * qb_4_rows_size) +
-                                    (i - M4 * 4) * qb_row_size),
-                                   K);
-    }
-  }
+  //   for (unsigned int i = M4 * 4; i < M; i++) {
+  //     nntrainer::quantize_row_q8_K(((float *)matBdata) + i * K,
+  //                                  (reinterpret_cast<char *>(quantBdata) +
+  //                                   (M4 * qb_4_rows_size) +
+  //                                   (i - M4 * 4) * qb_row_size),
+  //                                  K);
+  //   }
+  // }
 
-  if (!kernel->SetKernelArguments(0, &K, sizeof(int))) {
-    printf("Failed to set kernel argument 1 for mat_mul_q4_K_8x8_q8_K");
-    return;
-  }
-
-  if (!kernel->SetKernelSVMArguments(1, matCdata)) {
+  if (!kernel->SetKernelSVMArguments(0, matAdata)) {
     printf("Failed to set kernel SVM argument 0 for mat_mul_q4_K_8x8_q8_K");
     return;
   }
 
-  if (!kernel->SetKernelArguments(2, &N, sizeof(int))) {
-    printf("Failed to set kernel argument 1 for mat_mul_q4_K_8x8_q8_K");
+  if (!kernel->SetKernelSVMArguments(1, matBdata)) {
+    printf("Failed to set kernel SVM argument 1 for mat_mul_q4_K_8x8_q8_K");
     return;
   }
 
-  if (!kernel->SetKernelSVMArguments(3, matAdata)) {
+  if (!kernel->SetKernelSVMArguments(2, matCdata)) {
     printf("Failed to set kernel SVM argument 2 for mat_mul_q4_K_8x8_q8_K");
     return;
   }
 
-  if (!kernel->SetKernelSVMArguments(4, quantBdata)) {
-    printf("Failed to set kernel SVM argument 3 for mat_mul_q4_K_8x8_q8_K");
+  if (!kernel->SetKernelArguments(3, &M, sizeof(int))) {
+    printf("Failed to set kernel argument 3 for mat_mul_q4_K_8x8_q8_K");
     return;
   }
 
-  if (!kernel->SetKernelArguments(5, &M, sizeof(int))) {
-    printf("Failed to set kernel argument 5 for mat_mul_q4_K_8x8_q8_K");
+  if (!kernel->SetKernelArguments(4, &K, sizeof(int))) {
+    printf("Failed to set kernel argument 4 for mat_mul_q4_K_8x8_q8_K");
     return;
   }
 
-  if (!kernel->SetKernelArguments(6, &N, sizeof(int))) {
-    printf("Failed to set kernel argument 6 for mat_mul_q4_K_8x8_q8_K");
-    return;
-  }
-
-  const int tile_size = 64;
-  const int work_groups_count[3] = {(int)(M / 4) * tile_size, (int)N / 16, 1};
-  const int work_group_size[3] = {tile_size, 1, 1};
+  const int work_groups_count[3] = {4 * ((int)(N + 3) / 4), 8 * (int)M, 1};
+  const int work_group_size[3] = {4, 8, 1};
 
   if (!opencl::CommandQueueManager::GetInstance().DispatchCommand(
         kernel, work_groups_count, work_group_size)) {
@@ -288,31 +277,33 @@ void sgemm_q4_k_cl(const unsigned int M, const unsigned int N,
     return;
   }
 
-  /// @note Use CPU multithreaded GEMV for the leftover rows
-  int n_threads = 4;
-  for (unsigned int pb = M4 * 4; pb < M; pb++) {
-#pragma omp parallel for num_threads(n_threads)
-    for (int thread_idx = 0; thread_idx < n_threads; ++thread_idx) {
-      unsigned int M_step_start = (thread_idx * N) / n_threads;     // = 0
-      unsigned int M_step_end = ((thread_idx + 1) * N) / n_threads; // ne01 = N
+  //   /// @note Use CPU multithreaded GEMV for the leftover rows
+  //   int n_threads = 4;
+  //   for (unsigned int pb = M4 * 4; pb < M; pb++) {
+  // #pragma omp parallel for num_threads(n_threads)
+  //     for (int thread_idx = 0; thread_idx < n_threads; ++thread_idx) {
+  //       unsigned int M_step_start = (thread_idx * N) / n_threads;     // = 0
+  //       unsigned int M_step_end = ((thread_idx + 1) * N) / n_threads; // ne01
+  //       = N
 
-      M_step_start = (M_step_start % 8) ? M_step_start + 8 - (M_step_start % 8)
-                                        : M_step_start;
-      M_step_end =
-        (M_step_end % 8) ? M_step_end + 8 - (M_step_end % 8) : M_step_end;
+  //       M_step_start = (M_step_start % 8) ? M_step_start + 8 - (M_step_start
+  //       % 8)
+  //                                         : M_step_start;
+  //       M_step_end =
+  //         (M_step_end % 8) ? M_step_end + 8 - (M_step_end % 8) : M_step_end;
 
-      ::ggml_gemv_q4_K_8x8_q8_K(
-        K,
-        (float *)((matCdata + ((pb - M4 * 4) * N) + (M4 * 4 * N)) +
-                  M_step_start),
-        N, (void *)((char *)matAdata + M_step_start * B_step),
-        (char *)quantBdata + (M4 * qb_4_rows_size) +
-          (pb - M4 * 4) * qb_row_size,
-        1, M_step_end - M_step_start);
-    }
-  }
+  //       ::ggml_gemv_q4_K_8x8_q8_K(
+  //         K,
+  //         (float *)((matCdata + ((pb - M4 * 4) * N) + (M4 * 4 * N)) +
+  //                   M_step_start),
+  //         N, (void *)((char *)matAdata + M_step_start * B_step),
+  //         (char *)quantBdata + (M4 * qb_4_rows_size) +
+  //           (pb - M4 * 4) * qb_row_size,
+  //         1, M_step_end - M_step_start);
+  //     }
+  //   }
 
-  blas_cc->context_inst_.releaseSVMRegion(quantBdata);
+  //   blas_cc->context_inst_.releaseSVMRegion(quantBdata);
 }
 
 void sgemv_q4_k_cl(const unsigned int M, const unsigned int N, void *matAdata,

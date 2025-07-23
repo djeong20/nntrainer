@@ -19,191 +19,124 @@ namespace nntrainer {
 const std::string &getQ4KGemmClKernel() {
   static const std::string q4_k_gemm_cl_kernel =
     R"(
-    #define QK_K 256
-    #define NCOL_I 16
-    #define BLK_LEN 8
-    #define WG_SIZE 64
-
-    #define KMASK1 0x3f3f3f3fu
-    #define KMASK2 0x0f0f0f0fu
-    #define KMASK3 0x03030303u
-
     #ifdef cl_khr_fp16
     #pragma OPENCL EXTENSION cl_khr_fp16 : enable
     #endif
+    #pragma OPENCL EXTENSION cl_intel_subgroups : enable
+    #pragma OPENCL EXTENSION cl_intel_required_sub_group_size : enable
+    #pragma OPENCL EXTENSION cl_khr_subgroup_non_uniform_vote : enable
 
-    // https://bashbaug.github.io/OpenCL-Docs/pdf/OpenCL_C.pdf#page=101&zoom=100,0,206
-    #pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
+    #define u8BufToU16(buf, idx) (((ushort(buf[idx + 1]) << 8)) | buf[idx])
+    #define QK_K 256
+    #define N_DST 4
+
+    #define KMASK1 ((ushort)0x3f3f)
+    #define KMASK2 ((ushort)0x0f0f)
+    #define KMASK3 ((ushort)0xc0c0)
 
     typedef struct {
-      half d[8];
-      half dmin[8];
-      uchar scales[96];
-      uchar qs[1024];
-    } block_q4_Kx8;
-
-    typedef struct {
-      float d[4];
-      char qs[QK_K * 4];
-      short bsums[QK_K / 4];
-    } block_q8_Kx4;
+      half d;
+      half dmin;
+      uchar scales[12];
+      uchar qs[QK_K / 2];
+    } block_q4_K;
 
     /// @note convert_float() does not work for Nvidia GPU
     inline float fp16_to_fp32(half h) { return convert_float(h); }
-    #define REDUCE_ADD_SHORT8(v)                                                   \
-      ((v).s0 + (v).s1 + (v).s2 + (v).s3 + (v).s4 + (v).s5 + (v).s6 + (v).s7)
 
-    __kernel void mat_mul_q4_K_8x8_q8_K(const int n, __global float *restrict s,
-                                        const int bs, // leading stride in s
-                                        __global const block_q4_Kx8 *restrict vx,
-                                        __global const block_q8_Kx4 *restrict vy,
-                                        const int nr, const int nc) {
-      const int tile_y = get_group_id(0);
-      const int tile_x = get_group_id(1);
-      const int lane = get_local_id(0);
+    __attribute__((intel_reqd_sub_group_size(32)))
+    __attribute__((reqd_work_group_size(4, 8, 1)))
+    __kernel void mat_mul_q4_K_8x8_q8_K(__global const block_q4_K *restrict a,
+                                       __global const float *restrict b,
+                                       __global float *restrict c,
+                                       const int M, const int K) {
+      const uint ix = get_sub_group_local_id() / 8;  // 0...3
+      const uint it = get_sub_group_local_id() % 8;  // 0...7
+      const uint iq = it / 4; // 0 or 1
+      const uint ir = it % 4; // 0...3
 
-      const int lane_m = lane / NCOL_I; // 0-3  (row inside 4x16 tile)
-      const int lane_j = lane % NCOL_I; // 0-15 (col inside 4x16 tile)
+      const uint nb = K / QK_K;
 
-      const int nb = n / QK_K; // #256-element blocks
+      const uint r0 = get_group_id(0);
+      const uint r1 = get_group_id(1);
 
-      __local block_q4_Kx8 lB[2];
-      __local block_q8_Kx4 lA;
-      __local uint lutmp[2][32];
+      const uint first_row = r0 * N_DST;
 
-      float sumf = 0.0f;
-      float sum_minf = 0.0f;
+      const uint x_block = first_row * K / QK_K;
+      const uint y = r1 * K;
 
-      for (int b = 0; b < nb; ++b) {
-        // 1.  Copy one q8 block (A) and two q4 blocks (B0/B1) to LDS
-        {
-          __global const uchar *gB0 =
-            (__global const uchar *)(vx + (tile_x * 2 + 0) * nb + b);
-          __global const uchar *gB1 =
-            (__global const uchar *)(vx + (tile_x * 2 + 1) * nb + b);
-          __global const uchar *gA = (__global const uchar *)(vy + tile_y * nb + b);
+      float4 sumf = {0.0f, 0.0f, 0.0f, 0.0f};
+      uint y4 = y + ix * QK_K + 64 * iq + 8 * ir;
 
-          __local uchar *lBdst0 = (__local uchar *)&lB[0];
-          __local uchar *lBdst1 = (__local uchar *)&lB[1];
-          __local uchar *lAdst = (__local uchar *)&lA;
+      for (uint ib = ix; ib < nb; ib += 4) {
+        const uint block_idx = ib + x_block;
 
-          const int vecsB = (int)(sizeof(block_q4_Kx8) / 16);
-          const int vecsA = (int)(sizeof(block_q8_Kx4) / 16);
-
-          for (int v = lane; v < vecsB; v += WG_SIZE) {
-            vstore16(vload16(0, gB0 + v * 16), 0, lBdst0 + v * 16);
-            vstore16(vload16(0, gB1 + v * 16), 0, lBdst1 + v * 16);
-          }
-          for (int v = lane; v < vecsA; v += WG_SIZE) {
-            vstore16(vload16(0, gA + v * 16), 0, lAdst + v * 16);
-          }
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-
-        // 2.  All 64 lanes build the two 8x4 LUTs
-        for (int v = lane; v < 128; v += WG_SIZE) {
-          const int blk = v >> 6;       // 0 | 1
-          const int sb = (v & 63) >> 3; // 0-7
-          __local const uchar *src =
-            (__local const uchar *)&lB[blk].scales[0] + sb * 12;
-          __local uint *dst = lutmp[blk] + sb * 4;
-
-          uint4 tmp4 = vload4(0, (const __local uint *)src);
-          vstore4(tmp4, 0, dst);
-
-          dst[3] = ((dst[2] >> 4) & KMASK2) | (((dst[1] >> 6) & KMASK3) << 4);
-          uint t = dst[1] & KMASK1;
-          dst[1] = (dst[2] & KMASK2) | (((dst[0] >> 6) & KMASK3) << 4);
-          dst[2] = t;
-          dst[0] &= KMASK1;
-        }
-        barrier(CLK_LOCAL_MEM_FENCE); // LUTs ready
-
-        // 3.  Each lane accumulates one C-tile element
-        const int blk = lane_j >> 3;
-        const int lj = lane_j & 7;
-
-        const float dB = fp16_to_fp32(lB[blk].d[lj]);
-        const float dB_min = fp16_to_fp32(lB[blk].dmin[lj]);
-        const float dA = lA.d[lane_m];
-
-        __local const uchar *lbytes = (const __local uchar *)lutmp[blk];
-
-    #pragma unroll 16
-        for (int k = 0; k < 16; ++k) {      // QK_K/(2*BLK_LEN)
-          const int idxB = k * 64 + lj * 8; // 8 × 8 q4 block stride
-          const int idxA = (k >> 2) * 256 + (k & 3) * 32 + lane_m * 8;
-
-          const int sc0 = lbytes[(k / 4) * 32 + lj];
-          const int sc1 = lbytes[(k / 4) * 32 + 16 + lj];
-
-          const uchar8 q = vload8(0, lB[blk].qs + idxB);
-
-          const char8 a0 = vload8(0, lA.qs + idxA);
-          const char8 a1 = vload8(0, lA.qs + idxA + 128);
-
-          const uchar8 qlo = q & (uchar8)(0x0F); // low nibbles
-          const uchar8 qhi = q >> (uchar8)4;     // high nibbles
-   
-#if defined(__opencl_c_integer_dot_product_input_4x8bit)
-          const char4* a0_arr = (const char4*)(&a0);
-          const char4* a1_arr = (const char4*)(&a1);
-
-          const uchar4* qlo_arr = (const uchar4*)(&qlo);
-          const uchar4* qhi_arr = (const uchar4*)(&qhi);
-
-          // int dot(uchar4 a, char4 b) from __opencl_c_integer_dot_product_input_4x8bit 
-
-          
-          /// Loop solution
-          #if 1
-            int prod0 = 0;
-            int prod1 = 0;
-
-            # pragma unroll 2
-            for(int prod_idx = 0; prod_idx < 2; prod_idx++)
-            {
-              prod0 += dot(qlo_arr[prod_idx], a0_arr[prod_idx]);
-              prod1 += dot(qhi_arr[prod_idx], a1_arr[prod_idx]);
-            }
-          #else
-            /// No loop solution
-            const int prod00 = dot(qlo_arr[0], a0_arr[0]);
-            const int prod10 = dot(qhi_arr[0], a1_arr[0]);
-            
-            const int prod01 = dot(qlo_arr[1], a0_arr[1]);
-            const int prod11 = dot(qhi_arr[1], a1_arr[1]);    
-            
-            const int prod0 = prod00 + prod01;
-            const int prod1 = prod10 + prod11;
-          #endif
-#else
-          const int prod0 = REDUCE_ADD_SHORT8(convert_short8(qlo) * convert_short8(a0));
-          const int prod1 = REDUCE_ADD_SHORT8(convert_short8(qhi) * convert_short8(a1));
-#endif
-
-          const int sumi = prod0 * sc0 + prod1 * sc1;
-
-          sumf += (float)sumi * dB * dA;
+        float8 yl_0 = vload8(0, b + y4);
+        float8 yl_1 = vload8(0, b + y4 + 32);
+        float8 yh_0 = vload8(0, b + y4 + 128);
+        float8 yh_1 = vload8(0, b + y4 + 160);
+        float sumy[4] = {0.0f, 0.0f, 0.0f, 0.0f};        
+        for (int i = 0; i < 8; ++i) {
+          sumy[0] += yl_0[i];
+          sumy[1] += yl_1[i];
+          sumy[2] += yh_0[i];
+          sumy[3] += yh_1[i];
         }
 
-        // 4.  bias / min-d correction
-        for (int sb = 0; sb < 8; ++sb) {
-          __local const uchar *mins = lbytes + 8 + sb * 16;
-          __local const short *bsum = (__local const short *)&lA.bsums[0] + sb * 8 +
-                                      lane_m * 4 - ((sb & 1) * 6);
+        for (int row = 0; row < N_DST; ++row) {
+          uint row_idx = row * K / QK_K;
 
-          int macc = mins[lj] * (bsum[0] + bsum[1]);
-          sum_minf += (float)macc * dB_min * dA;
+          __global const ushort *scales = (__global const ushort*)(a[block_idx + row_idx].scales);
+          ushort sc_0 = scales[iq + 0];
+          ushort sc_2 = scales[iq + 2];
+          ushort sc_4 = scales[iq + 4];
+
+          ushort4 sc16;
+          sc16[0] = sc_0 & KMASK1;
+          sc16[1] = sc_2 & KMASK1;
+          sc16[2] = ((sc_4 >> 0) & KMASK2) | ((sc_0 & KMASK3) >> 2);
+          sc16[3] = ((sc_4 >> 4) & KMASK2) | ((sc_2 & KMASK3) >> 2);
+
+          float4 acc1 = {0.0f, 0.0f, 0.0f, 0.0f};
+          float4 acc2 = {0.0f, 0.0f, 0.0f, 0.0f};
+
+          __global const ushort *qs = (__global const ushort*)(a[block_idx + row_idx].qs);
+          ushort4 q1 = vload4(0, qs + 16 * iq + 4 * ir);
+          ushort4 q2 = vload4(0, qs + 32 + 16 * iq + 4 * ir);
+
+          acc1[0] = dot(yl_0.even, convert_float4(q1 & (ushort)0x000F));
+          acc1[1] = dot(yl_0.odd, convert_float4(q1 & (ushort)0x0F00));
+          acc1[2] = dot(yl_1.even, convert_float4(q1 & (ushort)0x00F0));
+          acc1[3] = dot(yl_1.odd, convert_float4(q1 & (ushort)0xF000));
+
+          acc2[0] = dot(yh_0.even, convert_float4(q2 & (ushort)0x000F));
+          acc2[1] = dot(yh_0.odd, convert_float4(q2 & (ushort)0x0F00));
+          acc2[2] = dot(yh_1.even, convert_float4(q2 & (ushort)0x00F0));
+          acc2[3] = dot(yh_1.odd, convert_float4(q2 & (ushort)0xF000));
+
+          uchar8 sc8;
+          sc8.even = convert_uchar4(sc16 & (ushort)0xFF);
+          sc8.odd = convert_uchar4(sc16 >> 8);
+
+          float dall = fp16_to_fp32(a[block_idx + row_idx].d);
+          float dmin = fp16_to_fp32(a[block_idx + row_idx].dmin);
+
+          sumf[row] += dall * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
+                               (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
+                               (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
+                               (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
+                               dmin *(sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
         }
-
-        barrier(CLK_LOCAL_MEM_FENCE);
+        
+        y4 += 4 * QK_K;
       }
 
-      // 5.  write one result element
-      const int out_row = tile_y * 4 + lane_m;
-      const int out_col = tile_x * NCOL_I + lane_j;
-      s[out_row * bs + out_col] = sumf - sum_minf;
+      for (int row = 0; row < N_DST; ++row) {
+          float all_sum = sub_group_reduce_add(sumf[row]);
+          if (sub_group_elect()) {
+              c[r1 * M + first_row + row] = all_sum;
+          }
+      }
     }
   )";
 
@@ -336,11 +269,11 @@ const std::string &getQ4KGemvClKernel() {
           const uchar8 qhi = q >> (uchar8)4;     // high nibbles
    
 #if defined(__opencl_c_integer_dot_product_input_4x8bit)
-          const char4* a0_arr = (const char4*)(&a0)
-          const char4* a1_arr = (const char4*)(&a1)
+          const char4* a0_arr = (const char4*)(&a0);
+          const char4* a1_arr = (const char4*)(&a1);
 
-          const uchar4* qlo_arr = (const uchar4*)(&qlo)
-          const uchar4* qhi_arr = (const uchar4*)(&qhi)
+          const uchar4* qlo_arr = (const uchar4*)(&qlo);
+          const uchar4* qhi_arr = (const uchar4*)(&qhi);
 
           // int dot(uchar4 a, char4 b) from __opencl_c_integer_dot_product_input_4x8bit 
           
@@ -352,8 +285,8 @@ const std::string &getQ4KGemvClKernel() {
             # pragma unroll 2
             for(int prod_idx = 0; prod_idx < 2; prod_idx++)
             {
-              prod0 += dot(qlo_arr[prod_idx], a0_arr[prod_idx])
-              prod1 += dot(qhi_arr[prod_idx], a1_arr[prod_idx])
+              prod0 += dot(qlo_arr[prod_idx], a0_arr[prod_idx]);
+              prod1 += dot(qhi_arr[prod_idx], a1_arr[prod_idx]);
             }
           #else
             /// No loop solution
