@@ -63,4 +63,4 @@ option('nnstreamer-subplugin-install-path', type: 'string', value: 'lib/nnstream
 
 # application related options
 option('enable-transformer', type: 'boolean', value: false)
-option('libiomp_root', type:'string', value: './libiomp_win')
+option('libiomp_root', type:'string', value: 'nntrainer-windows-resource/x64/openmp')
